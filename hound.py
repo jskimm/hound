@@ -31,6 +31,7 @@ except Exception:
     pass
 
 from commands.project import ProjectManager  # noqa: E402
+from analysis.session_files import iter_session_summary_files, load_session_summary  # noqa: E402
 
 app = typer.Typer(
     name="hound",
@@ -54,6 +55,10 @@ app.add_typer(poc_app, name="poc")
 # Create graph subcommand groups
 graph_app = typer.Typer(help="Build and manage knowledge graphs")
 app.add_typer(graph_app, name="graph")
+
+# Create benchmark subcommand group
+benchmark_app = typer.Typer(help="Benchmark Hound against external evaluation corpora")
+app.add_typer(benchmark_app, name="benchmark")
 
 # Plural 'graphs' group for bulk operations
 graphs_app = typer.Typer(help="Bulk graph operations (all graphs)")
@@ -134,9 +139,9 @@ def project_coverage(name: str = typer.Argument(..., help="Project name")):
             visited_nodes: set[str] = set()
             visited_cards: set[str] = set()
             if sessions_dir.exists():
-                for sf in sessions_dir.glob('*.json'):
+                for sf in iter_session_summary_files(sessions_dir):
                     try:
-                        data = _json.loads(sf.read_text())
+                        data = load_session_summary(sf)
                         cov_d = data.get('coverage', {})
                         visited_nodes.update([str(x) for x in cov_d.get('visited_node_ids', [])])
                         visited_cards.update([str(x) for x in cov_d.get('visited_card_ids', [])])
@@ -228,6 +233,55 @@ def project_plan(
         'output_json': output_json
     })
 
+evmbench_app = typer.Typer(help="Run EVMBench-style A/B benchmarks")
+benchmark_app.add_typer(evmbench_app, name="evmbench")
+
+
+@evmbench_app.command("prepare")
+def benchmark_evmbench_prepare(
+    workspace_root: Path | None = typer.Option(None, "--workspace-root", help="Workspace root for benchmark repos and results"),
+    split: str = typer.Option("debug", "--split", help="Task split to manifest: debug, detect, or all"),
+):
+    """Clone/update EVMBench repos and materialize task manifests."""
+    from commands.benchmark import prepare_cmd
+
+    prepare_cmd(workspace_root, split)
+
+
+@evmbench_app.command("run")
+def benchmark_evmbench_run(
+    workspace_root: Path | None = typer.Option(None, "--workspace-root", help="Workspace root for benchmark repos and results"),
+    split: str = typer.Option("debug", "--split", help="Task split to run: debug or detect"),
+    arm: str = typer.Option("both", "--arm", help="Benchmark arm: baseline, treatment, or both"),
+    mode: str = typer.Option("both", "--mode", help="Run mode: cold, long, or both"),
+    config_path: Path | None = typer.Option(None, "--config", help="Path to Hound config for graph/audit runs"),
+    limit: int | None = typer.Option(None, "--limit", help="Limit number of tasks for smoke runs"),
+    baseline_ref: str = typer.Option("c29890180b317b66b06342521c8e2d82117bb93b", "--baseline-ref", help="Git ref for the baseline arm"),
+):
+    """Run EVMBench A/B tasks through Hound."""
+    from commands.benchmark import run_cmd
+
+    run_cmd(
+        workspace_root=workspace_root,
+        split=split,
+        arm=arm,
+        mode=mode,
+        config_path=config_path,
+        limit=limit,
+        baseline_ref=baseline_ref,
+    )
+
+
+@evmbench_app.command("report")
+def benchmark_evmbench_report(
+    run_id: str = typer.Argument(..., help="Benchmark run id"),
+    workspace_root: Path | None = typer.Option(None, "--workspace-root", help="Workspace root for benchmark repos and results"),
+):
+    """Aggregate and render a previously completed EVMBench run."""
+    from commands.benchmark import report_cmd
+
+    report_cmd(workspace_root, run_id)
+
 # Removed 'reset-plan' and composite 'reset' commands. Use:
 # - graph reset <project>
 # - project reset-hypotheses <project>
@@ -309,6 +363,7 @@ def agent_audit(
     strategist_model: str = typer.Option(None, "--strategist-model", help="Override strategist model (e.g., gpt-4o-mini)"),
     session: str = typer.Option(None, "--session", help="Attach to a specific session ID"),
     new_session: bool = typer.Option(False, "--new-session", help="Create a new session"),
+    allow_test_writes: bool = typer.Option(False, "--allow-test-writes", help="Allow the audit to write test/regression artifacts under approved test paths"),
     session_private_hypotheses: bool = typer.Option(False, "--session-private-hypotheses", help="Keep new hypotheses private to this session"),
     telemetry: bool = typer.Option(False, "--telemetry", help="Expose local telemetry SSE/control and register instance"),
     strategist_two_pass: bool = typer.Option(False, "--strategist-two-pass", help="Enable strategist two-pass self-critique to reduce false positives"),
@@ -399,6 +454,7 @@ def agent_audit(
         'strategist_model': strategist_model,
         'session': session,
         'new_session': new_session,
+        'allow_test_writes': allow_test_writes,
         'session_private_hypotheses': session_private_hypotheses,
         'telemetry': telemetry,
         'strategist_two_pass': strategist_two_pass,

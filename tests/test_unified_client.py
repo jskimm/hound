@@ -20,8 +20,21 @@ class DummyProvider:
 class TestUnifiedClient(unittest.TestCase):
     def test_selects_openai_provider(self):
         cfg = {"models": {"reporting": {"provider": "openai", "model": "x"}}}
-        with patch('llm.unified_client.OpenAIProvider', DummyProvider):
+        with patch('llm.unified_client.has_codex_oauth', return_value=False), patch('llm.unified_client.OpenAIProvider', DummyProvider):
             uc = UnifiedLLMClient(cfg, profile="reporting")
             self.assertEqual(uc.provider.provider_name, "dummy")
             out = uc.raw(system="S", user="U")
             self.assertIn("SYS:S|USER:U", out)
+
+    def test_openai_provider_falls_back_to_codex_oauth(self):
+        cfg = {"models": {"reporting": {"provider": "openai", "model": "x"}}}
+        with patch('llm.unified_client.has_codex_oauth', return_value=True), patch.dict('os.environ', {}, clear=True):
+            with patch('llm.unified_client.CodexOAuthProvider', DummyProvider):
+                uc = UnifiedLLMClient(cfg, profile="reporting")
+                self.assertEqual(uc.provider.provider_name, "dummy")
+
+    def test_selects_codex_provider_explicitly(self):
+        cfg = {"models": {"reporting": {"provider": "codex", "model": "x"}}}
+        with patch('llm.unified_client.CodexOAuthProvider', DummyProvider):
+            uc = UnifiedLLMClient(cfg, profile="reporting")
+            self.assertEqual(uc.provider.provider_name, "dummy")

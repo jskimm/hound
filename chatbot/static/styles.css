@@ -59,6 +59,21 @@ button:disabled { opacity:.5; cursor:default; }
 .tabs { display:flex; gap:6px; margin: 6px 2px 8px; }
 .tab { font-size: var(--fs-small); padding:6px 10px; border:1px solid var(--line); background:#0b1a23; color:#a7e4ff; border-radius:999px; cursor:pointer; }
 .tab.active { background:#0d2633; color:#e6f1f7; border-color:#173a4b; }
+.orchestrator-summary { display:flex; justify-content:space-between; align-items:center; gap:12px; padding:10px 12px; margin:0 2px 10px; background:linear-gradient(135deg, rgba(91,192,255,0.08), rgba(255,255,255,0.02)); border:1px solid #123142; border-radius:10px; }
+.summary-head { font-size: var(--fs-small); text-transform:uppercase; letter-spacing:.12em; color:#9cc7dd; white-space:nowrap; }
+.summary-badges { display:flex; gap:8px; flex-wrap:wrap; }
+.summary-chip { display:flex; gap:8px; align-items:center; padding:6px 10px; border-radius:999px; background:#08131a; border:1px solid #143142; }
+.summary-chip-label { font-size:11px; text-transform:uppercase; letter-spacing:.08em; color:#8fbcd5; }
+.summary-chip-value { font-size: var(--fs-small); color:#e6f1f7; }
+.agent-cards { display:grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap:10px; margin:0 2px 10px; }
+.agent-card { background:linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.01)); border:1px solid #113041; border-radius:12px; padding:12px; min-height:110px; }
+.agent-card.empty { min-height:auto; }
+.agent-card-head { display:flex; justify-content:space-between; align-items:flex-start; gap:12px; margin-bottom:8px; }
+.agent-role { font-weight:600; color:#e6f1f7; }
+.agent-id { font-size:11px; color:#8fbcd5; text-align:right; word-break:break-word; }
+.agent-goal { color:#cfe7f3; line-height:1.45; min-height:2.9em; }
+.agent-meta { display:flex; gap:6px; flex-wrap:wrap; margin-top:10px; }
+.agent-meta-pill { font-size:11px; padding:3px 8px; border-radius:999px; border:1px solid #143142; background:#0d1a24; color:#a7e4ff; }
 .nowinvest { margin:0 2px 10px; font-size: var(--fs-small); color:#a9bfd3; opacity:.95; background:#0b1720; border:1px solid #0e2330; border-radius:8px; padding:6px 10px; }
 .activity { height: 36vh; overflow:auto; padding:10px; margin:0; background:#08131a; border:1px solid var(--line); border-radius:9px; font-size: var(--fs-base); line-height:1.5; color:#cfe7f3; }
 .plan { height: 36vh; overflow:auto; padding:10px; margin:0; background:#08131a; border:1px solid var(--line); border-radius:9px; font-size: var(--fs-base); line-height:1.5; color:#cfe7f3; }
@@ -130,10 +145,30 @@ button:disabled { opacity:.5; cursor:default; }
 .evt { display:flex; gap:10px; align-items:flex-start; padding:6px 8px; border-bottom:1px solid #0f2430; }
 .evt:last-child { border-bottom:none; }
 .evt .time { color:#8fbcd5; font-size: var(--fs-small); width:64px; flex:0 0 auto; }
+.evt-labels { display:flex; gap:6px; flex-wrap:wrap; align-items:flex-start; min-width:140px; flex:0 0 200px; }
 .evt .tag { font-size: 11px; padding:2px 8px; border-radius:999px; border:1px solid #143142; background:#0d1a24; color:#a7e4ff; flex:0 0 auto; }
 .evt .tag.fetch { color:#22c55e; border-color:#1f3b2b; background:#0c1a12; }
 .evt .tag.memo { color:#f59e0b; border-color:#3b2f1f; background:#1a140c; }
 .evt .tag.graph { color:#60a5fa; border-color:#1e3a8a; background:#0b1323; }
 .evt .tag.hyp { color:#f87171; border-color:#3b1f1f; background:#1a0c0c; }
 .evt .tag.think { color:#a78bfa; border-color:#372f61; background:#120f1a; }
+.evt .tag.agent-role { color:#b8f0d5; border-color:#1d4d38; background:#0b1e17; }
+.evt .tag.agent-id { color:#9ecfe6; border-color:#1c3f52; background:#0b1720; }
 .evt .msg { white-space:pre-wrap; word-break:break-word; flex:1; opacity:.95; }
+
+@media (max-width: 1180px) {
+  .grid { grid-template-columns: 220px 1fr; }
+  .codecol { grid-column: 1 / -1; height: 42vh; }
+}
+
+@media (max-width: 760px) {
+  .wrap { padding: 14px; }
+  .grid { grid-template-columns: 1fr; }
+  .left, .center, .codecol { height: auto; min-height: 32vh; }
+  .audit-head { flex-direction:column; align-items:stretch; }
+  .audit-head .controls { flex-wrap:wrap; }
+  .audit-head input { min-width: 0; width: 100%; }
+  .orchestrator-summary { flex-direction:column; align-items:flex-start; }
+  .evt { flex-direction:column; }
+  .evt .time, .evt-labels { width:auto; flex:auto; }
+}

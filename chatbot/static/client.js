@@ -12,10 +12,14 @@ let userTranscript = '';
 let activityES = null;
 let pendingEvt = null;
 let nowInvTimer = null;
+let dashboardTimer = null;
 let codeViewEl = null;
 let hoverCardEl = null;
 let hypoDetailEl = null;
 let avatarHoldTimer = null;
+let orchestratorSummaryEl = null;
+let summaryBadgesEl = null;
+let agentCardsEl = null;
 
 // Inuzumi avatar asset rules
 const INUZUMI_BASE = '/static/inuzumi';
@@ -90,6 +94,100 @@ function chatAppendDelta(role, delta) {
   }
 }
 function esc(s){ return String(s||'').replace(/[&<>]/g, c=> ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+function prettyLabel(v){
+  return String(v || '')
+    .replace(/[_-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/\b\w/g, (c)=> c.toUpperCase());
+}
+function fmtIter(iteration, maxIterations){
+  const hasIter = Number.isFinite(Number(iteration)) && String(iteration).trim() !== '';
+  const hasMax = Number.isFinite(Number(maxIterations)) && String(maxIterations).trim() !== '';
+  if (hasIter && hasMax) return `${Number(iteration)}/${Number(maxIterations)}`;
+  if (hasIter) return String(Number(iteration));
+  if (hasMax) return `0/${Number(maxIterations)}`;
+  return '';
+}
+function pickFirst(...vals){
+  for (const v of vals){
+    if (v == null) continue;
+    if (typeof v === 'string' && !v.trim()) continue;
+    return v;
+  }
+  return null;
+}
+function normalizeAgents(raw){
+  if (!raw) return [];
+  if (Array.isArray(raw)) return raw.filter(Boolean);
+  if (typeof raw === 'object'){
+    return Object.entries(raw).map(([id, val])=> ({ agent_id: id, ...(val || {}) }));
+  }
+  return [];
+}
+function normalizeDashboard(payload){
+  const data = payload && typeof payload === 'object' ? payload : {};
+  const orchestrator = data.orchestrator && typeof data.orchestrator === 'object' ? data.orchestrator : {};
+  const current = data.current && typeof data.current === 'object' ? data.current : {};
+  const sessionStatus = pickFirst(
+    data.session_status,
+    orchestrator.session_status,
+    orchestrator.status,
+    current.session_status,
+    current.status,
+    'unknown'
+  );
+  const currentLoop = pickFirst(
+    orchestrator.current_loop,
+    orchestrator.loop_id,
+    data.current_loop,
+    data.loop_id,
+    current.loop_id
+  );
+  const phase = pickFirst(orchestrator.phase, data.phase, current.phase);
+  const rawAgents = normalizeAgents(
+    pickFirst(data.agents, orchestrator.agents, orchestrator.agent_states, data.agent_states, current.agents)
+  );
+  const adaptive = orchestrator.adaptive && typeof orchestrator.adaptive === 'object' ? orchestrator.adaptive : {};
+  const agents = rawAgents.map((agent, index)=>{
+    const nestedCurrent = agent.current && typeof agent.current === 'object' ? agent.current : {};
+    const assignment = agent.assignment && typeof agent.assignment === 'object' ? agent.assignment : {};
+    return {
+      id: String(pickFirst(agent.agent_id, agent.id, agent.name, assignment.agent_id, `agent-${index + 1}`)),
+      role: pickFirst(agent.agent_role, agent.role, assignment.agent_role, assignment.role, agent.name, 'Agent'),
+      goal: pickFirst(agent.current_goal, agent.goal, nestedCurrent.goal, assignment.goal, current.goal, data.current_goal),
+      status: pickFirst(agent.status, nestedCurrent.status, assignment.status, sessionStatus, 'unknown'),
+      iteration: pickFirst(agent.iteration, nestedCurrent.iteration, agent.investigation_index),
+      maxIterations: pickFirst(agent.max_iterations, nestedCurrent.max_iterations, agent.investigation_total, data.max_iterations),
+      phase: pickFirst(agent.phase, nestedCurrent.phase, phase)
+    };
+  }).filter((agent)=> agent.role || agent.goal || agent.status);
+  if (agents.length === 0){
+    const fallbackGoal = pickFirst(current.goal, data.current_goal);
+    if (fallbackGoal || (sessionStatus && String(sessionStatus).toLowerCase() !== 'unknown')){
+      agents.push({
+        id: 'agent-1',
+        role: 'Audit agent',
+        goal: fallbackGoal,
+        status: sessionStatus,
+        iteration: pickFirst(data.iteration, current.iteration),
+        maxIterations: pickFirst(data.max_iterations, current.max_iterations),
+        phase
+      });
+    }
+  }
+  return {
+    sessionStatus: String(sessionStatus || 'unknown'),
+    currentLoop: currentLoop == null ? '' : String(currentLoop),
+    phase: phase == null ? '' : String(phase),
+    currentGoal: pickFirst(current.goal, data.current_goal, agents[0] && agents[0].goal) || '',
+    promotedRuleCount: pickFirst(adaptive.promoted_rule_count, 0),
+    deprioritizedPatternCount: pickFirst(adaptive.deprioritized_pattern_count, 0),
+    executionBlockerCount: pickFirst(adaptive.execution_blocker_count, 0),
+    proofFeedback: adaptive.proof_feedback && typeof adaptive.proof_feedback === 'object' ? adaptive.proof_feedback : {},
+    agents
+  };
+}
 function highlightSolidity(src){
   // Very lightweight highlighter: order matters (comments/strings first)
   let s = esc(src);
@@ -124,6 +222,82 @@ function showCode(content, relpath){
   if (!codeViewEl) return;
   codeViewEl.innerHTML = renderCode(content||'', relpath||'');
   try { codeViewEl.scrollTop = 0; } catch(_){ }
+}
+function renderOrchestratorSummary(summary){
+  if (!orchestratorSummaryEl || !summaryBadgesEl) return;
+  const items = [
+    { label: 'Session', value: prettyLabel(summary.sessionStatus || 'unknown'), cls: 'status' },
+    { label: 'Loop', value: summary.currentLoop, cls: 'loop', empty: '—' },
+    { label: 'Phase', value: summary.phase, cls: 'phase', empty: '—' },
+    { label: 'Promoted', value: summary.promotedRuleCount, cls: 'adaptive', empty: '0' },
+    { label: 'Deprioritized', value: summary.deprioritizedPatternCount, cls: 'adaptive', empty: '0' },
+    { label: 'Execution Blockers', value: summary.executionBlockerCount, cls: 'adaptive', empty: '0' }
+  ];
+  const feedback = summary.proofFeedback && typeof summary.proofFeedback === 'object' ? summary.proofFeedback : {};
+  if (Object.keys(feedback).length > 0){
+    items.push({ label: 'Proof Fail', value: feedback.failed || 0, cls: 'adaptive', empty: '0' });
+    items.push({ label: 'Proof Pass', value: feedback.passed || 0, cls: 'adaptive', empty: '0' });
+  }
+  summaryBadgesEl.innerHTML = items.map((item)=> (
+    `<div class="summary-chip ${esc(item.cls || '')}">
+      <span class="summary-chip-label">${esc(item.label)}</span>
+      <span class="summary-chip-value">${esc(item.value || item.empty || '—')}</span>
+    </div>`
+  )).join('');
+}
+function renderAgentCards(summary){
+  if (!agentCardsEl) return;
+  const agents = Array.isArray(summary.agents) ? summary.agents : [];
+  agentCardsEl.dataset.hasAgents = agents.length > 0 ? 'true' : 'false';
+  if (agents.length === 0){
+    agentCardsEl.innerHTML = '<div class="agent-card empty"><div class="agent-role">No active agents</div><div class="agent-goal">Attach to a session to monitor work in progress.</div></div>';
+    return;
+  }
+  agentCardsEl.innerHTML = agents.map((agent)=>{
+    const iter = fmtIter(agent.iteration, agent.maxIterations);
+    const meta = [
+      agent.status ? `<span class="agent-meta-pill">${esc(prettyLabel(agent.status))}</span>` : '',
+      iter ? `<span class="agent-meta-pill">${esc(`Iteration ${iter}`)}</span>` : '',
+      agent.phase ? `<span class="agent-meta-pill">${esc(prettyLabel(agent.phase))}</span>` : ''
+    ].filter(Boolean).join('');
+    return `<article class="agent-card">
+      <div class="agent-card-head">
+        <div class="agent-role">${esc(prettyLabel(agent.role || 'Agent'))}</div>
+        <div class="agent-id">${esc(agent.id || '')}</div>
+      </div>
+      <div class="agent-goal">${esc(agent.goal || 'Waiting for work')}</div>
+      <div class="agent-meta">${meta || '<span class="agent-meta-pill">Idle</span>'}</div>
+    </article>`;
+  }).join('');
+}
+function renderDashboardState(payload){
+  const summary = normalizeDashboard(payload);
+  renderOrchestratorSummary(summary);
+  renderAgentCards(summary);
+  const nowInv = document.getElementById('nowInvestigating');
+  if (nowInv){
+    const activeGoals = (summary.agents || [])
+      .filter((agent)=> agent.goal)
+      .map((agent)=> `${prettyLabel(agent.role || 'Agent')}: ${agent.goal}`);
+    if (activeGoals.length > 0) nowInv.textContent = `Now investigating: ${activeGoals.join(' | ')}`;
+    else if (summary.currentGoal) nowInv.textContent = `Now investigating: ${summary.currentGoal}`;
+    else nowInv.textContent = 'Now investigating: —';
+  }
+}
+async function refreshDashboard(projectId){
+  const proj = (projectId || '').trim();
+  if (!proj){
+    renderDashboardState({});
+    return;
+  }
+  try{
+    const r = await fetch(`/api/dashboard?project=${encodeURIComponent(proj)}`);
+    if (!r.ok) throw new Error(`dashboard ${r.status}`);
+    const j = await r.json();
+    renderDashboardState(j);
+  }catch(_){
+    renderDashboardState({ current_goal: '', session_status: 'unknown' });
+  }
 }
 function setAvatarLegacy(name){
   const emo = String(name||'neutral').toLowerCase();
@@ -484,9 +658,13 @@ window.addEventListener('DOMContentLoaded', ()=>{
   const tabHypo = document.getElementById('tabHypo');
   const hypoView = document.getElementById('hypoView');
   codeViewEl = document.getElementById('codeView');
+  orchestratorSummaryEl = document.getElementById('orchestratorSummary');
+  summaryBadgesEl = document.getElementById('summaryBadges');
+  agentCardsEl = document.getElementById('agentCards');
   // Ensure chat container is cached even before connecting
   if (!chatEl) chatEl = document.getElementById('chat');
   const nowInv = document.getElementById('nowInvestigating');
+  renderDashboardState({});
 
   // Track whether we attached to an instance via Start
   let isAttached = false;
@@ -518,6 +696,7 @@ window.addEventListener('DOMContentLoaded', ()=>{
         if (prefer.length > 0){
           const chosen = prefer[0]; // server sorts by started_at desc
           projectInput.value = String(chosen.project_id||'');
+          refreshDashboard(projectInput.value);
           // Persist active project on server for tool calls
           fetch('/api/context', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ project_id: projectInput.value }) }).catch(()=>{});
         }
@@ -577,12 +756,14 @@ window.addEventListener('DOMContentLoaded', ()=>{
     // Mark UI as attached
     isAttached = true; attachedProjectId = proj; attachedInstanceId = instId;
     try { window.attachedProjectId = attachedProjectId; } catch(_) {}
+    refreshDashboard(attachedProjectId);
     actStartBtn.disabled = true; actStopBtn.disabled = false;
   });
   actStopBtn.addEventListener('click', ()=>{
     stopActivity();
     isAttached = false; attachedProjectId = ''; attachedInstanceId = '';
     try { window.attachedProjectId = attachedProjectId; } catch(_) {}
+    renderDashboardState({});
     actStartBtn.disabled = false; actStopBtn.disabled = true;
   });
 
@@ -662,7 +843,8 @@ window.addEventListener('DOMContentLoaded', ()=>{
       const imp = it.impact ? `Impact: ${it.impact}` : '';
       const cat = it.category ? `Category: ${it.category}` : '';
       const fa = (Array.isArray(it.focus_areas) && it.focus_areas.length) ? `Focus: ${it.focus_areas.slice(0,3).join(', ')}` : '';
-      const meta = [pr, imp, cat, fa].filter(Boolean).join(' | ');
+      const owner = it.agent_role ? `Owner: ${prettyLabel(it.agent_role)}` : (it.agent_id ? `Owner: ${it.agent_id}` : '');
+      const meta = [owner, pr, imp, cat, fa].filter(Boolean).join(' | ');
       html += `<div class="plan-item"><div class="plan-mark" ${cls}>${mark}</div><div class="plan-body"><div class="plan-goal">${esc(it.goal||'Unknown')}</div>${meta?`<div class="plan-meta">${esc(meta)}</div>`:''}</div></div>`;
     }
     planView.innerHTML = html;
@@ -685,13 +867,17 @@ window.addEventListener('DOMContentLoaded', ()=>{
       const conf = (typeof h.confidence==='number') ? Math.round(h.confidence*100) : (h.confidence||0);
       const status = (h.status||'proposed');
       const title = esc(h.title||'(untitled)');
+      const provenance = [
+        h.agent_role ? prettyLabel(h.agent_role) : '',
+        h.agent_id ? `Agent ${h.agent_id}` : ''
+      ].filter(Boolean).join(' • ');
       // Remove native title tooltips; use rich hover cards
       const rejectedCls = (String(status).toLowerCase()==='rejected') ? ' rejected' : '';
       html += `<div class="hypo-item${rejectedCls}">
         <div class="hypo-mark">${conf}%</div>
         <div class="hypo-body">
           <div class="hypo-title" data-hid="${esc(h.id||'')}" data-desc="${esc(h.description||'')}" data-type="${esc(h.vulnerability_type||'')}" data-status="${esc(status)}" data-conf="${String(conf)}">${title}</div>
-          <div class="hypo-meta">${esc(status)}</div>
+          <div class="hypo-meta">${esc(status)}${provenance ? ` • ${esc(provenance)}` : ''}</div>
         </div>
         <div class="hypo-actions">
           <button class="confirm" data-hid="${esc(h.id||'')}" title="Mark confirmed (100%)">Confirm</button>
@@ -769,15 +955,31 @@ window.addEventListener('DOMContentLoaded', ()=>{
     if (!activity) return;
     const d = document.createElement('div'); d.className='evt';
     const time = document.createElement('div'); time.className='time'; time.textContent = obj.time || '';
+    const labelWrap = document.createElement('div'); labelWrap.className = 'evt-labels';
     const tag = document.createElement('div'); tag.className = 'tag ' + (obj.cls||''); tag.textContent = obj.label || 'Act';
+    labelWrap.appendChild(tag);
+    if (obj.agentRole){
+      const roleTag = document.createElement('div');
+      roleTag.className = 'tag agent-role';
+      roleTag.textContent = prettyLabel(obj.agentRole);
+      labelWrap.appendChild(roleTag);
+    }
+    if (obj.agentId){
+      const idTag = document.createElement('div');
+      idTag.className = 'tag agent-id';
+      idTag.textContent = obj.agentId;
+      labelWrap.appendChild(idTag);
+    }
     const msg = document.createElement('div'); msg.className='msg'; msg.textContent = obj.text || '';
-    d.appendChild(time); d.appendChild(tag); d.appendChild(msg);
+    d.appendChild(time);
+    d.appendChild(labelWrap);
+    d.appendChild(msg);
     activity.appendChild(d);
     activity.scrollTop = activity.scrollHeight;
   }
 let lastIter = 0;
 const _seenEvt = new Set();
-function _dedupeKey(j){ return `${j.type||''}|${j.action||''}|${j.iteration||''}|${(j.message||'').slice(0,80)}|${(j.reasoning||'').slice(0,80)}`; }
+function _dedupeKey(j){ return `${j.agent_id||j.agent_role||'single'}|${j.type||''}|${j.action||''}|${j.iteration||''}|${(j.message||'').slice(0,80)}|${(j.reasoning||'').slice(0,80)}`; }
   function handleActivityData(data){
     // Try JSON first (telemetry SSE)
     try{
@@ -807,7 +1009,14 @@ function _dedupeKey(j){ return `${j.type||''}|${j.action||''}|${j.iteration||''}
         text = j.message || j.reasoning || '';
       }
       lastIter = j.iteration || lastIter;
-      appendEvt({ time: `[${tstr}] #${lastIter||'-'}`, label: tag.label, cls: tag.cls, text });
+      appendEvt({
+        time: `[${tstr}] #${lastIter||'-'}`,
+        label: tag.label,
+        cls: tag.cls,
+        text,
+        agentId: j.agent_id || '',
+        agentRole: j.agent_role || ''
+      });
       // Do not mirror activity stream into chat; keep chat for user ↔ assistant messages only
       return;
     }catch(_){ /* not JSON */ }
@@ -823,6 +1032,9 @@ function _dedupeKey(j){ return `${j.type||''}|${j.action||''}|${j.iteration||''}
   }
   function startActivity(proj, instId){
     stopActivity();
+    _seenEvt.clear();
+    lastIter = 0;
+    refreshDashboard(proj);
     const url = `/api/instance/status?id=${encodeURIComponent(instId)}`;
     activityES = new EventSource(url);
     activityES.onmessage = (e)=>{ handleActivityData(e.data); };
@@ -835,10 +1047,11 @@ function _dedupeKey(j){ return `${j.type||''}|${j.action||''}|${j.iteration||''}
         const j = await r.json();
         if (j && j.ok){
           const s = j.current_goal || j.summary || '';
-          if (nowInv) nowInv.textContent = s ? `Now investigating: ${s}` : 'Now investigating: —';
+          if (nowInv && agentCardsEl && agentCardsEl.dataset.hasAgents !== 'true') nowInv.textContent = s ? `Now investigating: ${s}` : 'Now investigating: —';
         }
       }catch(_){ /* ignore */ }
     }, 2000);
+    dashboardTimer = setInterval(()=>{ refreshDashboard(proj); }, 3000);
     // Prefill stream with recent events so the UI isn't empty on connect
     fetch(`/api/instance/recent?id=${encodeURIComponent(instId)}&limit=60`).then(r=>r.json()).then(j=>{
       if (!j || !Array.isArray(j.events)) return;
@@ -847,9 +1060,13 @@ function _dedupeKey(j){ return `${j.type||''}|${j.action||''}|${j.iteration||''}
       }
     }).catch(()=>{});
   }
-  function stopActivity(){ if (activityES){ activityES.close(); activityES=null; } }
+  function stopActivity(){
+    if (activityES){ activityES.close(); activityES=null; }
+    if (nowInvTimer){ clearInterval(nowInvTimer); nowInvTimer=null; }
+    if (dashboardTimer){ clearInterval(dashboardTimer); dashboardTimer=null; }
+  }
   // Clear pinned updater when leaving page
-  window.addEventListener('beforeunload', ()=>{ if (nowInvTimer){ clearInterval(nowInvTimer); nowInvTimer=null; } });
+  window.addEventListener('beforeunload', ()=>{ stopActivity(); });
 
   async function resolveInstanceId(proj){
     try{
@@ -874,7 +1091,10 @@ function _dedupeKey(j){ return `${j.type||''}|${j.action||''}|${j.iteration||''}
 
   // Initialize project input from server context if any
   fetch('/api/context').then(r=>r.json()).then(j=>{
-    if (j && j.project_id && !projectInput.value) projectInput.value = j.project_id;
+    if (j && j.project_id){
+      if (!projectInput.value) projectInput.value = j.project_id;
+      refreshDashboard(j.project_id);
+    }
   }).catch(()=>{});
 });
 

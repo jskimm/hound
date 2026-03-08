@@ -1,12 +1,15 @@
 """Unified LLM client that supports multiple providers."""
 from __future__ import annotations
 
+import os
 import time
 from typing import Any, TypeVar
 
 from pydantic import BaseModel
 
 from .anthropic_provider import AnthropicProvider
+from .codex_auth import has_codex_oauth
+from .codex_provider import CodexOAuthProvider
 from .deepseek_provider import DeepSeekProvider
 from .gemini_provider import GeminiProvider
 from .mock_provider import MockProvider
@@ -67,6 +70,11 @@ class UnifiedLLMClient:
         
         # Determine provider (default to openai for backward compatibility)
         provider_name = model_config.get("provider", "openai").lower()
+        if provider_name == "openai":
+            api_key_env = cfg.get("openai", {}).get("api_key_env", "OPENAI_API_KEY")
+            oauth_fallback = cfg.get("openai", {}).get("oauth_fallback", True)
+            if not os.environ.get(api_key_env) and oauth_fallback and has_codex_oauth(cfg):
+                provider_name = "codex"
         
         # Get provider-specific configuration
         timeout_cfg = cfg.get("timeouts", {})
@@ -128,6 +136,10 @@ class UnifiedLLMClient:
             self.provider = MockProvider(
                 **common_kwargs,
                 mock_instance=mock_instance
+            )
+        elif provider_name == "codex":
+            self.provider = CodexOAuthProvider(
+                **common_kwargs
             )
         else:
             raise ValueError(f"Unknown provider: {provider_name}")

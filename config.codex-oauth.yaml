@@ -1,0 +1,46 @@
+openai:
+  api_key_env: OPENAI_API_KEY
+  oauth_fallback: true
+
+codex:
+  command: codex
+  sandbox: read-only
+  model: gpt-5
+
+models:
+  graph:
+    provider: openai
+    model: gpt-5
+    max_context: 256000
+  scout:
+    provider: openai
+    model: gpt-5
+    max_context: 256000
+  strategist:
+    provider: openai
+    model: gpt-5
+    max_context: 256000
+    plan_reasoning_effort: medium
+    hypothesize_reasoning_effort: high
+  lightweight:
+    provider: openai
+    model: gpt-5
+  finalize:
+    provider: openai
+    model: gpt-5
+    reasoning_effort: high
+  reporting:
+    provider: openai
+    model: gpt-5
+
+context:
+  max_tokens: 256000
+  compression_threshold: 0.75
+
+timeouts:
+  request_seconds: 300
+
+retries:
+  max_attempts: 1
+  backoff_min_seconds: 1
+  backoff_max_seconds: 1

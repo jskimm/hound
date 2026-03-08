@@ -21,6 +21,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from analysis.scout import Scout
 from analysis.session_tracker import SessionTracker
 from analysis.strategist import Strategist
+from analysis.audit_orchestrator import (
+    AgentProgress,
+    AuditOrchestrator,
+    build_default_registry,
+)
+from analysis.test_proof_agent import TestProofAgentRole
 from llm.token_tracker import get_token_tracker
 
 
@@ -618,7 +624,8 @@ class AgentRunner:
     def __init__(self, project_id: str, config_path: Path | None = None, 
                  iterations: int | None = None, time_limit_minutes: int | None = None,
                  debug: bool = False, platform: str | None = None, model: str | None = None,
-                 session: str | None = None, new_session: bool = False, mode: str | None = None):
+                 session: str | None = None, new_session: bool = False, mode: str | None = None,
+                 allow_test_writes: bool = False):
         self.project_id = project_id
         self.config_path = config_path
         self.max_iterations = iterations
@@ -634,7 +641,9 @@ class AgentRunner:
         self.project_dir: Path | None = None
         self.plan_store = None
         self.session_id: str | None = session
+        self.session_path: Path | None = None
         self.new_session: bool = new_session
+        self.allow_test_writes: bool = allow_test_writes
         self._agent_log: list[str] = []
         self._last_applied_steer: str | None = None
         # Track which steering text triggered a forced replan (to avoid repeats)
@@ -644,6 +653,8 @@ class AgentRunner:
         self._node_to_graph_map_cache: dict[str, str] | None = None
         # Track current audit phase (Early/Mid/Late) for display and planning hints
         self._current_phase: str | None = None
+        self.orchestrator: AuditOrchestrator | None = None
+        self.role_registry = build_default_registry()
         
     def initialize(self):
         """Initialize the agent."""
@@ -755,6 +766,12 @@ class AgentRunner:
         
         # Keep config for planning
         self.config = config
+        self.config.setdefault('execution_policy', {})
+        self.config['execution_policy']['allow_test_writes'] = bool(self.allow_test_writes)
+        try:
+            self.role_registry.register("test_proof_agent", TestProofAgentRole(self.config))
+        except Exception:
+            pass
         # Remember project_dir for plan storage
         self.project_dir = project_dir
         
@@ -809,6 +826,7 @@ class AgentRunner:
             sinfo = sm.get_or_create(self.session_id, new_session=self.new_session)
             # Persist normalized session id
             self.session_id = sinfo.session_id
+            self.session_path = sinfo.path
             # Plan file in session directory
             plan_path = sinfo.path / "plan.json"
             self.plan_store = PlanStore(plan_path, agent_id=f"runner_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
@@ -829,6 +847,9 @@ class AgentRunner:
                     'project_path': str(self.project_dir),
                     'created_at': datetime.now().isoformat(),
                     'models': self.config.get('models', {}) if self.config else {},
+                    'execution_policy': {
+                        'allow_test_writes': bool(self.allow_test_writes),
+                    },
                 }
                 # Persist mission for visibility
                 try:
@@ -844,6 +865,153 @@ class AgentRunner:
             self.plan_store = None
 
         return True
+
+    def _enabled_roles(self) -> list[str]:
+        """Return enabled cooperative roles in execution order."""
+        cfg = (self.config or {}).get('orchestrator', {}) if getattr(self, 'config', None) else {}
+        roles = cfg.get('roles') or ["scout", "threat_modeler", "test_proof_agent", "invariant_auditor", "strategist"]
+        return [str(role) for role in roles]
+
+    def _ensure_orchestrator(self) -> AuditOrchestrator | None:
+        """Create the orchestrator lazily once the session directory is known."""
+        if self.orchestrator is not None:
+            return self.orchestrator
+        if not self.session_id:
+            return None
+        session_dir = self.session_path or ((self.project_dir or Path.cwd()) / "sessions" / self.session_id)
+        self.orchestrator = AuditOrchestrator(session_dir, self.session_id, enabled_roles=self._enabled_roles())
+        return self.orchestrator
+
+    def _publish_telemetry(self, evt: dict):
+        """Best-effort telemetry publication with orchestrator context."""
+        try:
+            pub = getattr(self, '_telemetry_publish', None)
+            if not callable(pub):
+                return
+            payload = dict(evt or {})
+            payload.setdefault('session_id', self.session_id)
+            payload.setdefault('loop_id', getattr(self, '_planned_round', 0))
+            orch = getattr(self, 'orchestrator', None)
+            if orch is not None:
+                payload.setdefault('phase', orch.state.current_phase)
+            pub(payload)
+        except Exception:
+            pass
+
+    def _update_role_state(self, *, role: str, agent_id: str, status: str,
+                           goal: str = "", iteration: int = 0, max_iterations: int = 0,
+                           planning_batch: int = 0, investigation_index: int = 0,
+                           investigation_total: int = 0, message: str = ""):
+        """Persist per-role progress for the current orchestrator loop."""
+        orch = self._ensure_orchestrator()
+        if orch is None:
+            return
+        orch.update_agent(AgentProgress(
+            agent_role=role,
+            agent_id=agent_id,
+            status=status,
+            current_goal=goal,
+            loop_id=getattr(self, '_planned_round', 0),
+            iteration=iteration,
+            max_iterations=max_iterations,
+            planning_batch=planning_batch,
+            investigation_index=investigation_index,
+            investigation_total=investigation_total,
+            last_message=message,
+        ))
+
+    def _run_support_roles(self, planned_round: int):
+        """Refresh threat model and invariant artifacts for the current loop."""
+        orch = self._ensure_orchestrator()
+        if orch is None or not self.agent or not self.project_dir:
+            return
+        session_dir = self.session_path or orch.session_dir
+        if "threat_modeler" in self._enabled_roles():
+            self._update_role_state(
+                role="threat_modeler",
+                agent_id=f"{self.agent.agent_id}:threat_modeler",
+                status="running",
+                planning_batch=planned_round,
+                message="Refreshing threat model lanes",
+            )
+            self._publish_telemetry({
+                'type': 'status',
+                'message': 'Refreshing threat model lanes',
+                'agent_role': 'threat_modeler',
+                'agent_id': f"{self.agent.agent_id}:threat_modeler",
+            })
+            result = self.role_registry.get("threat_modeler").run(
+                loaded_data=self.agent.loaded_data,
+                session_dir=session_dir,
+                project_dir=self.project_dir,
+                allow_test_writes=self.allow_test_writes,
+            )
+            for name, path in result.items():
+                orch.attach_artifact(name, path)
+            self._update_role_state(
+                role="threat_modeler",
+                agent_id=f"{self.agent.agent_id}:threat_modeler",
+                status="completed",
+                planning_batch=planned_round,
+                message="Threat model refreshed",
+            )
+        if "invariant_auditor" in self._enabled_roles():
+            if "test_proof_agent" in self._enabled_roles():
+                inv_path = session_dir / "invariants.json"
+                invariants = []
+                if inv_path.exists():
+                    try:
+                        invariants = (json.loads(inv_path.read_text(encoding="utf-8")) or {}).get("invariants", [])
+                    except Exception:
+                        invariants = []
+                self._update_role_state(
+                    role="test_proof_agent",
+                    agent_id=f"{self.agent.agent_id}:test_proof_agent",
+                    status="running",
+                    planning_batch=planned_round,
+                    message="Planning invariant proof cases",
+                )
+                result = self.role_registry.get("test_proof_agent").run(
+                    invariants=invariants,
+                    session_dir=session_dir,
+                    project_dir=self.project_dir,
+                    loaded_data=self.agent.loaded_data,
+                    allow_test_writes=self.allow_test_writes,
+                    loop_id=planned_round,
+                    session_id=self.session_id or "",
+                )
+                for name, path in result.items():
+                    orch.attach_artifact(name, path)
+                self._update_role_state(
+                    role="test_proof_agent",
+                    agent_id=f"{self.agent.agent_id}:test_proof_agent",
+                    status="completed",
+                    planning_batch=planned_round,
+                    message="Proof cases planned",
+                )
+            self._update_role_state(
+                role="invariant_auditor",
+                agent_id=f"{self.agent.agent_id}:invariant_auditor",
+                status="running",
+                planning_batch=planned_round,
+                message="Refreshing invariant contrast checks",
+            )
+            self._publish_telemetry({
+                'type': 'status',
+                'message': 'Refreshing invariant contrast checks',
+                'agent_role': 'invariant_auditor',
+                'agent_id': f"{self.agent.agent_id}:invariant_auditor",
+            })
+            inv_path = self.role_registry.get("invariant_auditor").run(session_dir=session_dir)
+            if inv_path:
+                orch.attach_artifact("invariants", inv_path)
+            self._update_role_state(
+                role="invariant_auditor",
+                agent_id=f"{self.agent.agent_id}:invariant_auditor",
+                status="completed",
+                planning_batch=planned_round,
+                message="Invariant checks refreshed",
+            )
 
     # ---------------------- Steering Helpers (persistent) ----------------------
     def _steer_cursor_path(self) -> Path:
@@ -1756,14 +1924,19 @@ class AgentRunner:
         # Generate session ID if not provided
         if not self.session_id:
             self.session_id = f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{self.agent.agent_id}"
+        if not self.session_path:
+            self.session_path = sessions_dir / self.session_id
+            self.session_path.mkdir(parents=True, exist_ok=True)
         
         # Initialize session tracker
-        self.session_tracker = SessionTracker(sessions_dir, self.session_id)
+        self.session_tracker = SessionTracker(self.session_path, self.session_id)
         # Mark session as active when attached/started
         try:
             self.session_tracker.set_status('active')
+            self.session_tracker.set_execution_policy(allow_test_writes=self.allow_test_writes)
         except Exception:
             pass
+        self._ensure_orchestrator()
         
         # Initialize coverage tracking
         graphs_dir = project_dir / "graphs"
@@ -1857,19 +2030,16 @@ class AgentRunner:
             msg = info.get('message', '')
             it = info.get('iteration', 0)
             # Telemetry publish (best-effort)
-            try:
-                pub = getattr(self, '_telemetry_publish', None)
-                if callable(pub):
-                    pub({
-                        'type': status or 'progress',
-                        'iteration': it,
-                        'message': msg,
-                        'action': info.get('action'),
-                        'parameters': info.get('parameters', {}),
-                        'reasoning': info.get('reasoning', ''),
-                    })
-            except Exception:
-                pass
+            self._publish_telemetry({
+                'type': status or 'progress',
+                'iteration': it,
+                'message': msg,
+                'action': info.get('action'),
+                'parameters': info.get('parameters', {}),
+                'reasoning': info.get('reasoning', ''),
+                'agent_role': 'scout',
+                'agent_id': self.agent.agent_id if self.agent else 'scout',
+            })
             
             if status == 'decision':
                 act = info.get('action', '-')
@@ -2124,6 +2294,7 @@ class AgentRunner:
 
         results = []
         planned_round = 0
+        self._planned_round = 0
         start_overall = time.time()
         time_up = False
 
@@ -2164,6 +2335,7 @@ class AgentRunner:
                     break
 
             planned_round += 1
+            self._planned_round = planned_round
             # Announce planning batch and current phase before spinner (print once)
             try:
                 console.print(f"\n[bold cyan]═══ Planning Batch {planned_round} ═══[/bold cyan]")
@@ -2181,6 +2353,9 @@ class AgentRunner:
                         nodes_pct = float(((cov_tmp or {}).get('nodes') or {}).get('percent') or 0.0)
                         phase = 'Coverage' if nodes_pct < 90.0 else 'Saliency'
                 if phase:
+                    orch = self._ensure_orchestrator()
+                    if orch is not None:
+                        orch.begin_loop(planned_round, phase)
                     if phase == 'Coverage':
                         console.print("\n[bold yellow]═══ PHASE 1: SWEEP ═══[/bold yellow]")
                         console.print("[dim]Wide sweep for shallow bugs at medium granularity[/dim]")
@@ -2200,6 +2375,12 @@ class AgentRunner:
                         f"Cards {cov['cards']['visited']}/{cov['cards']['total']} "
                         f"({cov['cards']['percent']:.1f}%)"
                     )
+            except Exception:
+                pass
+
+            # Refresh threat model and invariant artifacts before planning a batch
+            try:
+                self._run_support_roles(planned_round)
             except Exception:
                 pass
 
@@ -2379,6 +2560,17 @@ class AgentRunner:
 
                 self.start_time = time.time()
                 started_at_iso = datetime.now().isoformat()
+                self._update_role_state(
+                    role="scout",
+                    agent_id=self.agent.agent_id,
+                    status="running",
+                    goal=inv.goal,
+                    max_iterations=max_iters,
+                    planning_batch=planned_round,
+                    investigation_index=idx + 1,
+                    investigation_total=len(items),
+                    message="Investigation started",
+                )
                 try:
                     # Enhanced progress callback that logs model actions and thoughts
                     def _cb(info: dict):
@@ -2390,32 +2582,46 @@ class AgentRunner:
                         msg = info.get('message', '')
                         it = info.get('iteration', 0)
                         # Publish telemetry for UI (decision/result/etc.)
-                        try:
-                            pub = getattr(self, '_telemetry_publish', None)
-                            if callable(pub):
-                                payload = {
-                                    'type': status or 'progress',
-                                    'iteration': it,
-                                    'message': msg,
-                                    'action': info.get('action'),
-                                    'parameters': info.get('parameters', {}),
-                                    'reasoning': info.get('reasoning', ''),
-                                }
-                                if status == 'result':
-                                    # Slim down large result fields to keep UI responsive
-                                    res = info.get('result', {}) or {}
-                                    if isinstance(res, dict):
-                                        slim = dict(res)
-                                        # Drop verbose text and heavy fields
-                                        for k in ('graph_display', 'nodes_display', 'full_response', 'graph_data', 'data', 'nodes', 'edges', 'code', 'cards'):
-                                            if k in slim:
-                                                slim.pop(k, None)
-                                        payload['result'] = slim
-                                    else:
-                                        payload['result'] = res
-                                pub(payload)
-                        except Exception:
-                            pass
+                        payload = {
+                            'type': status or 'progress',
+                            'iteration': it,
+                            'message': msg,
+                            'action': info.get('action'),
+                            'parameters': info.get('parameters', {}),
+                            'reasoning': info.get('reasoning', ''),
+                            'agent_role': 'scout',
+                            'agent_id': self.agent.agent_id if self.agent else 'scout',
+                            'goal': inv.goal,
+                            'planning_batch': planned_round,
+                            'investigation_index': idx + 1,
+                            'investigation_total': len(items),
+                            'max_iterations': max_iters,
+                        }
+                        if status == 'result':
+                            # Slim down large result fields to keep UI responsive
+                            res = info.get('result', {}) or {}
+                            if isinstance(res, dict):
+                                slim = dict(res)
+                                # Drop verbose text and heavy fields
+                                for k in ('graph_display', 'nodes_display', 'full_response', 'graph_data', 'data', 'nodes', 'edges', 'code', 'cards'):
+                                    if k in slim:
+                                        slim.pop(k, None)
+                                payload['result'] = slim
+                            else:
+                                payload['result'] = res
+                        self._publish_telemetry(payload)
+                        self._update_role_state(
+                            role="scout",
+                            agent_id=self.agent.agent_id if self.agent else "scout",
+                            status="running" if status not in {"complete", "generating_report"} else status,
+                            goal=inv.goal,
+                            iteration=it,
+                            max_iterations=max_iters,
+                            planning_batch=planned_round,
+                            investigation_index=idx + 1,
+                            investigation_total=len(items),
+                            message=msg,
+                        )
 
                         # Mid-investigation steering: if a global directive arrives, request abort
                         try:
@@ -2490,6 +2696,17 @@ class AgentRunner:
                             
                             # Special handling for deep_think
                             if act == 'deep_think':
+                                self._update_role_state(
+                                    role="strategist",
+                                    agent_id=f"{self.agent.agent_id}:strategist" if self.agent else "strategist",
+                                    status="running",
+                                    goal=inv.goal,
+                                    iteration=it,
+                                    planning_batch=planned_round,
+                                    investigation_index=idx + 1,
+                                    investigation_total=len(items),
+                                    message="Strategist deep analysis in progress",
+                                )
                                 console.print("\n[bold magenta]═══ CALLING STRATEGIST FOR DEEP ANALYSIS ═══[/bold magenta]")
                                 try:
                                     strat_cfg = (self.config or {}).get('models', {}).get('strategist', {})
@@ -2534,6 +2751,17 @@ class AgentRunner:
                                     console.print(f"\n[bold red]Strategist Error:[/bold red] {error_msg}")
                                     console.print("[yellow]Continuing with scout exploration...[/yellow]")
                                 elif result.get('status') == 'success':
+                                    self._update_role_state(
+                                        role="strategist",
+                                        agent_id=f"{self.agent.agent_id}:strategist" if self.agent else "strategist",
+                                        status="completed",
+                                        goal=inv.goal,
+                                        iteration=it,
+                                        planning_batch=planned_round,
+                                        investigation_index=idx + 1,
+                                        investigation_total=len(items),
+                                        message="Strategist analysis complete",
+                                    )
                                     console.print("\n[bold green]═══ STRATEGIST ANALYSIS COMPLETE ═══[/bold green]")
                                     
                                     # Parse and display hypotheses from JSON response
@@ -2766,8 +2994,12 @@ class AgentRunner:
                     # Update session tracker with investigation and token usage
                     self.session_tracker.add_investigation({
                         'goal': inv.goal,
+                        'agent_id': self.agent.agent_id if self.agent else 'scout',
+                        'agent_role': 'scout',
                         'priority': getattr(inv, 'priority', 0),
                         'category': getattr(inv, 'category', None),
+                        'status': 'completed',
+                        'loop_id': planned_round,
                         'frame_id': getattr(inv, 'frame_id', None),
                         'planned_batch': planned_round,
                         'planned_index': idx + 1,
@@ -2796,6 +3028,18 @@ class AgentRunner:
                 except Exception:
                     pass
                 self._agent_log.append(f"✓ Completed: {inv.goal}")
+                self._update_role_state(
+                    role="scout",
+                    agent_id=self.agent.agent_id if self.agent else "scout",
+                    status="completed",
+                    goal=inv.goal,
+                    iteration=(report or {}).get('iterations_completed', 0) if isinstance(report, dict) else 0,
+                    max_iterations=max_iters,
+                    planning_batch=planned_round,
+                    investigation_index=idx + 1,
+                    investigation_total=len(items),
+                    message="Investigation completed",
+                )
                 # Mark plan item done
                 try:
                     if getattr(inv, 'frame_id', None) and self.plan_store:
@@ -2859,6 +3103,8 @@ class AgentRunner:
         self.session_tracker.update_token_usage(token_tracker.get_summary())
         final_status = 'interrupted' if 'time_up' in locals() and time_up else 'completed'
         self.session_tracker.finalize(status=final_status)
+        if self.orchestrator is not None:
+            self.orchestrator.finish(final_status)
         
         # Show final coverage
         coverage_stats = self.session_tracker.get_coverage_stats()
@@ -2918,6 +3164,7 @@ class AgentRunner:
 @click.option('--strategist-model', default=None, help='Override strategist model (e.g., gpt-4o-mini)')
 @click.option('--session', default=None, help='Attach to a specific session ID')
 @click.option('--new-session', is_flag=True, help='Create a new session')
+@click.option('--allow-test-writes', is_flag=True, help='Allow the audit to write test/regression artifacts under approved test paths')
 @click.option('--session-private-hypotheses', is_flag=True, help='Keep new hypotheses private to this session')
 @click.option('--telemetry', is_flag=True, help='Expose local (localhost) telemetry SSE/control and register instance')
 @click.option('--strategist-two-pass', is_flag=True, help='Enable strategist two-pass self-critique to reduce false positives')
@@ -2925,13 +3172,25 @@ class AgentRunner:
 def agent(project_id: str, iterations: int | None, plan_n: int, time_limit: int | None, 
           config: str | None, debug: bool, mode: str | None, platform: str | None, model: str | None,
           strategist_platform: str | None, strategist_model: str | None,
-          session: str | None, new_session: bool, session_private_hypotheses: bool,
+          session: str | None, new_session: bool, allow_test_writes: bool, session_private_hypotheses: bool,
           telemetry: bool, strategist_two_pass: bool, mission: str | None):
     """Run autonomous security analysis agent."""
     
     config_path = Path(config) if config else None
     
-    runner = AgentRunner(project_id, config_path, iterations, time_limit, debug, platform, model, session=session, new_session=new_session, mode=mode)
+    runner = AgentRunner(
+        project_id,
+        config_path,
+        iterations,
+        time_limit,
+        debug,
+        platform,
+        model,
+        session=session,
+        new_session=new_session,
+        mode=mode,
+        allow_test_writes=allow_test_writes,
+    )
     try:
         runner.mission = mission
     except Exception:
@@ -2958,9 +3217,16 @@ def agent(project_id: str, iterations: int | None, plan_n: int, time_limit: int 
                     pd = Path(project_id) if Path(project_id).exists() else get_project_dir(project_id)
                 tele = TelemetryServer(str(project_id), Path(pd))
                 tele.start()
+                if getattr(runner, 'session_id', None):
+                    tele.set_session(runner.session_id)
                 # Emit a friendly boot event so telemetry streams show activity immediately
                 try:
-                    tele.publish({'type': 'status', 'message': 'audit session started', 'iteration': 0})
+                    tele.publish({
+                        'type': 'status',
+                        'message': 'audit session started',
+                        'iteration': 0,
+                        'session_id': getattr(runner, 'session_id', None),
+                    })
                 except Exception:
                     pass
             except Exception:

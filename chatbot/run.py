@@ -8,6 +8,13 @@ from pathlib import Path
 import requests
 from flask import Flask, Response, jsonify, request, send_from_directory
 
+from analysis.proof_memory import load_adaptive_memory
+from analysis.session_files import (
+    iter_session_summary_files,
+    load_session_summary,
+    session_dir_from_summary_file,
+)
+
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
 
@@ -255,22 +262,49 @@ def create_app():
             pass
         return None
 
-    def _read_latest_session(proj: Path) -> dict:
+    def _latest_session_context(proj: Path) -> tuple[dict, Path | None]:
         sessions_dir = proj / "sessions"
         session_file = None
         if sessions_dir.exists():
-            jsons = sorted(sessions_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+            jsons = iter_session_summary_files(sessions_dir)
             session_file = jsons[0] if jsons else None
         if not session_file:
+            return {}, None
+        return load_session_summary(session_file), session_dir_from_summary_file(session_file)
+
+    def _read_latest_session(proj: Path) -> dict:
+        data, _ = _latest_session_context(proj)
+        return data
+
+    def _read_latest_orchestrator(proj: Path) -> dict:
+        _, session_dir = _latest_session_context(proj)
+        if not session_dir:
+            return {}
+        path = session_dir / "orchestrator.json"
+        if not path.exists():
             return {}
         try:
-            with session_file.open('r', encoding='utf-8') as f:
-                return json.load(f)
+            return json.loads(path.read_text(encoding="utf-8"))
         except Exception:
-            try:
-                return json.loads(session_file.read_text())
-            except Exception:
-                return {}
+            return {}
+
+    def _read_latest_proof_feedback(proj: Path) -> dict:
+        _, session_dir = _latest_session_context(proj)
+        if not session_dir:
+            return {}
+        path = session_dir / "proof_feedback.json"
+        if not path.exists():
+            return {}
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+    def _read_adaptive_memory(proj: Path) -> dict:
+        try:
+            return load_adaptive_memory(proj)
+        except Exception:
+            return {}
 
     def _resolve_graphs(proj: Path) -> dict:
         """Return mapping of graph name -> path string.
@@ -499,7 +533,7 @@ def create_app():
                 # Pick latest session json by mtime
                 session_file = None
                 if sessions_dir.exists():
-                    jsons = sorted(sessions_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+                    jsons = iter_session_summary_files(sessions_dir)
                     session_file = jsons[0] if jsons else None
                 status = "idle"
                 coverage = {"nodes": {"visited": 0, "total": 0, "percent": 0.0},
@@ -508,7 +542,7 @@ def create_app():
                 calls = 0
                 if session_file:
                     try:
-                        data = json.loads(session_file.read_text())
+                        data = load_session_summary(session_file)
                         status = data.get("status", status)
                         coverage = data.get("coverage", coverage)
                         tu = (data.get("token_usage") or {}).get("total_usage", {})
@@ -742,6 +776,10 @@ def create_app():
                             'description': h.get('description'),
                             'confidence': h.get('confidence'),
                             'status': h.get('status'),
+                            'agent_id': h.get('created_by'),
+                            'agent_role': h.get('agent_role'),
+                            'created_by': h.get('created_by'),
+                            'session_id': h.get('session_id'),
                             'node_refs': node_refs,
                             'files': files
                         })
@@ -1323,6 +1361,9 @@ def create_app():
         if not proj:
             return jsonify({"error": f"project not found: {pid}"}), 404
         sess = _read_latest_session(proj)
+        orch = _read_latest_orchestrator(proj)
+        proof_feedback = _read_latest_proof_feedback(proj)
+        adaptive_memory = _read_adaptive_memory(proj)
         # Plan: take last planning batch
         planning = sess.get('planning_history') or []
         plan_items = []
@@ -1373,7 +1414,8 @@ def create_app():
                         'type': h.get('vulnerability_type'),
                         'description': h.get('description'),
                         'confidence': h.get('confidence'),
-                        'status': h.get('status')
+                        'status': h.get('status'),
+                        'created_by': h.get('created_by'),
                     })
         except Exception:
             pass
@@ -1386,6 +1428,24 @@ def create_app():
             'current': {'goal': current_goal},
             'top_hypotheses': top_hyps,
             'coverage': coverage,
+            'orchestrator': {
+                'status': orch.get('status') or sess.get('status', 'unknown'),
+                'session_status': orch.get('status') or sess.get('status', 'unknown'),
+                'current_loop': orch.get('current_loop', 0),
+                'current_phase': orch.get('current_phase', ''),
+                'phase': orch.get('current_phase', ''),
+                'enabled_roles': orch.get('enabled_roles', []),
+                'artifacts': orch.get('artifacts', {}),
+                'adaptive': {
+                    'promoted_rule_count': len(adaptive_memory.get('promoted_rules') or []),
+                    'deprioritized_pattern_count': len(adaptive_memory.get('deprioritized_patterns') or []),
+                    'execution_blocker_count': len(adaptive_memory.get('execution_blockers') or []),
+                    'proof_feedback': proof_feedback.get('summary') or {},
+                },
+            },
+            'adaptive_memory': adaptive_memory,
+            'proof_feedback': proof_feedback,
+            'agents': list((orch.get('agents') or {}).values()),
             'token_usage': {
                 'total_tokens': int(tu.get('total_tokens', 0)),
                 'call_count': int(tu.get('call_count', 0))

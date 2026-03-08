@@ -61,6 +61,8 @@ export OPENAI_API_KEY=your_key_here
 export OPENAI_BASE_URL=https://api.openai.com
 ```
 
+If `OPENAI_API_KEY` is absent, Hound can also fall back to a local `codex` ChatGPT OAuth login automatically, as long as `codex login status` is already authenticated on the machine.
+
 Using Gemini via Vertex AI (optional):
 
 - Enable Vertex AI mode (instead of AI Studio) and set your GCP project and region.
@@ -106,6 +108,20 @@ Copy the example configuration and edit as needed:
 cp hound/config.yaml.example hound/config.yaml
 # then edit hound/config.yaml to select providers/models and options
 ```
+
+`openai.oauth_fallback: true` lets existing `provider: openai` profiles transparently switch to the local Codex OAuth bridge when no API key is present.
+
+Adaptive proof-planning settings live under `proof_planning` in `config.yaml`. These settings control:
+- how many concrete proof/test cases can be rendered per loop,
+- how many learned candidates are reviewed for project-wide reuse,
+- and how proof cases are ranked using contradiction, coverage, feedback, and novelty.
+
+Important:
+- `promoted_rules`, `deprioritized_patterns`, and `execution_blockers` are not config keys.
+- They are runtime outputs stored in `adaptive_memory.json`.
+- `promoted_rules` are project-specific rules/patterns that survived strategist review and can influence later loops or later sessions.
+- `deprioritized_patterns` are soft-negative memories: lower-priority patterns that can return later if new contradictions or stronger evidence appear.
+- `execution_blockers` are proof-generation or harness failures and must not be interpreted as security rejection.
 
 Notes:
 - Defaults work out-of-the-box; you can override many options via CLI flags.

@@ -43,6 +43,18 @@ class HypothesisBatchJSON(BaseModel):
     guidance: list[str] = Field(default_factory=list)
 
 
+class AdaptiveReviewDecision(BaseModel):
+    candidate_id: str
+    decision: str = Field(default="deprioritize", description="approve | deprioritize | invalid_codegen | duplicate | insufficient_evidence")
+    rationale: str = Field(default="")
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    revisit_if: str = Field(default="")
+
+
+class AdaptiveReviewBatch(BaseModel):
+    decisions: list[AdaptiveReviewDecision] = Field(default_factory=list)
+
+
 def _choose_profile(cfg: dict[str, Any]) -> str:
     # Prefer explicit strategist, then guidance, then agent as last resort
     try:
@@ -869,4 +881,36 @@ class Strategist:
                 pass
             return items[:3]
 
-__all__ = ["Strategist", "PlanItemSchema", "PlanBatch"]
+    def review_adaptive_candidates(
+        self,
+        *,
+        project_summary: str,
+        candidates: list[dict[str, Any]],
+        existing_memory_summary: str = "",
+    ) -> list[dict[str, Any]]:
+        """Review adaptive proof-learning candidates before project-wide promotion."""
+        system = (
+            "You are a skeptical senior security reviewer.\n"
+            "Review candidate project-specific rules and proof patterns learned from audit loops.\n"
+            "Approve only items that are reusable for future loops in this same project and are supported by concrete signals.\n"
+            "Use 'deprioritize' for weak/generic patterns, 'duplicate' for redundant patterns, "
+            "and 'invalid_codegen' only for harness/codegen/tooling blockers.\n"
+            "Return JSON only.\n"
+        )
+        user = (
+            f"PROJECT SUMMARY:\n{project_summary}\n\n"
+            f"EXISTING PROJECT MEMORY:\n{existing_memory_summary or '(none)'}\n\n"
+            f"CANDIDATES:\n{candidates}\n\n"
+            "For each candidate, return: candidate_id, decision, rationale, confidence, revisit_if."
+        )
+        self._log_usage("adaptive_review", system, user)
+        batch = self.llm.parse(system=system, user=user, schema=AdaptiveReviewBatch)
+        return [item.model_dump() for item in batch.decisions]
+
+__all__ = [
+    "AdaptiveReviewBatch",
+    "AdaptiveReviewDecision",
+    "Strategist",
+    "PlanItemSchema",
+    "PlanBatch",
+]

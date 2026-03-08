@@ -18,6 +18,13 @@ from rich.panel import Panel
 from rich.prompt import Confirm
 from rich.table import Table
 
+from analysis.session_files import (
+    count_sessions,
+    iter_session_summary_files,
+    load_session_summary,
+    resolve_session_summary_file,
+)
+
 console = Console()
 
 
@@ -150,7 +157,7 @@ class ProjectManager:
                     # Check for analysis results
                     graphs_exist = len(list((project_dir / "graphs").glob("*.json"))) > 0
                     sessions_dir = project_dir / "sessions"
-                    sessions_count = len(list(sessions_dir.glob("*.json"))) if sessions_dir.exists() else 0
+                    sessions_count = count_sessions(sessions_dir) if sessions_dir.exists() else 0
                     # Count hypotheses if present
                     hypotheses_count = 0
                     confirmed_count = 0
@@ -295,7 +302,7 @@ class ProjectManager:
             if project_dir.exists():
                 graphs_count = len(list((project_dir / "graphs").glob("*.json")))
                 sessions_dir = project_dir / "sessions"
-                sessions_count = len(list(sessions_dir.glob("*.json"))) if sessions_dir.exists() else 0
+                sessions_count = count_sessions(sessions_dir) if sessions_dir.exists() else 0
                 has_data = graphs_count > 0 or sessions_count > 0
             
             if has_data and not Confirm.ask(
@@ -462,7 +469,7 @@ def info(name: str):
     graphs_files = list((project_dir / "graphs").glob("*.json"))
     manifest_files = list((project_dir / "manifest").glob("*"))
     sessions_dir = project_dir / "sessions"
-    sessions = list(sessions_dir.glob("*.json")) if sessions_dir.exists() else []
+    sessions = iter_session_summary_files(sessions_dir) if sessions_dir.exists() else []
     reports = list((project_dir / "reports").glob("*"))
     
     # Get coverage statistics from latest session
@@ -473,10 +480,9 @@ def info(name: str):
         # Get most recent session
         latest_session_file = max(sessions, key=lambda x: x.stat().st_mtime)
         try:
-            with open(latest_session_file) as f:
-                latest_session = json.load(f)
-                if 'coverage' in latest_session:
-                    coverage_stats = latest_session['coverage']
+            latest_session = load_session_summary(latest_session_file)
+            if 'coverage' in latest_session:
+                coverage_stats = latest_session['coverage']
         except Exception:
             pass
     
@@ -1005,7 +1011,7 @@ def sessions(project_name: str, session_id: str | None, list_sessions: bool, out
     
     sessions_dir = Path(project_path) / "sessions"
     
-    if not sessions_dir.exists() or not list(sessions_dir.glob("*.json")):
+    if not sessions_dir.exists() or not count_sessions(sessions_dir):
         console.print(f"[yellow]No sessions found for project '{project_name}'.[/yellow]")
         return
     
@@ -1018,19 +1024,22 @@ def sessions(project_name: str, session_id: str | None, list_sessions: bool, out
 def _list_sessions(sessions_dir: Path, output_json: bool):
     """List all sessions in a project."""
     items = []
-    for sess_file in sorted(sessions_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+    for sess_file in iter_session_summary_files(sessions_dir):
         try:
-            with open(sess_file) as f:
-                data = json.load(f)
+            data = load_session_summary(sess_file)
+            session_id = data.get('session_id') or (
+                sess_file.parent.name if sess_file.name == "session.json" else sess_file.stem
+            )
             items.append({
-                'session_id': data.get('session_id', sess_file.stem),
+                'session_id': session_id,
                 'status': data.get('status', 'unknown'),
                 'start_time': data.get('start_time', ''),
                 'end_time': data.get('end_time', ''),
                 'investigations': len(data.get('investigations', [])),
             })
         except Exception:
-            items.append({'session_id': sess_file.stem, 'status': 'unknown', 'start_time': '', 'end_time': '', 'investigations': 0})
+            fallback_id = sess_file.parent.name if sess_file.name == "session.json" else sess_file.stem
+            items.append({'session_id': fallback_id, 'status': 'unknown', 'start_time': '', 'end_time': '', 'investigations': 0})
 
     if output_json:
         click.echo(json.dumps(items, indent=2))
@@ -1067,20 +1076,14 @@ def _list_sessions(sessions_dir: Path, output_json: bool):
 
 def _show_session_details(sessions_dir: Path, session_id: str, output_json: bool):
     """Show details for a specific session."""
-    sess_file = sessions_dir / f"{session_id}.json"
-    if not sess_file.exists():
-        # Try prefix match
-        candidates = sorted([p for p in sessions_dir.glob("*.json") if p.stem.startswith(session_id)], key=lambda p: p.stat().st_mtime, reverse=True)
-        if candidates:
-            sess_file = candidates[0]
-        else:
-            console.print(f"[red]Session '{session_id}' not found.[/red]")
-            console.print("[dim]Use --list to see available sessions.[/dim]")
-            return
+    sess_file = resolve_session_summary_file(sessions_dir, session_id)
+    if not sess_file:
+        console.print(f"[red]Session '{session_id}' not found.[/red]")
+        console.print("[dim]Use --list to see available sessions.[/dim]")
+        return
 
     try:
-        with open(sess_file) as f:
-            data = json.load(f)
+        data = load_session_summary(sess_file)
     except Exception as e:
         console.print(f"[red]Error reading session file: {e}[/red]")
         return
@@ -1089,7 +1092,8 @@ def _show_session_details(sessions_dir: Path, session_id: str, output_json: bool
         click.echo(json.dumps(data, indent=2))
         return
 
-    console.print(Panel.fit(f"[bold cyan]Session Details: {sess_file.stem}[/bold cyan]", border_style="cyan"))
+    header_id = data.get('session_id') or (sess_file.parent.name if sess_file.name == "session.json" else sess_file.stem)
+    console.print(Panel.fit(f"[bold cyan]Session Details: {header_id}[/bold cyan]", border_style="cyan"))
 
     console.print("\n[bold]Basic Information:[/bold]")
     console.print(f"  Start Time: {data.get('start_time', 'Unknown')}")

@@ -3,8 +3,18 @@
 # API keys configuration
 openai:
   api_key_env: OPENAI_API_KEY
+  oauth_fallback: true
   # Optional: override base URL (env var OPENAI_BASE_URL takes precedence)
   # base_url: https://api.openai.com
+
+codex:
+  command: codex
+  sandbox: read-only
+  # Optional: override the auth file if you keep Codex credentials elsewhere.
+  # auth_file: ~/.codex/auth.json
+  # Optional: force a specific Codex model for OAuth fallback.
+  # The default fallback model is gpt-5 because ChatGPT OAuth does not accept all API model aliases.
+  # model: gpt-5
 
 gemini:
   api_key_env: GOOGLE_API_KEY
@@ -88,6 +98,46 @@ retries:
   max_attempts: 3
   backoff_min_seconds: 1
   backoff_max_seconds: 2
+
+proof_planning:
+  # Maximum number of concrete proof cases that the proof planner may render
+  # into real test code in a single loop. Higher values improve breadth but
+  # also increase duplicate/noise risk and test runtime.
+  max_concrete_cases_per_loop: 8
+
+  # Maximum number of learned candidates that the strategist reviews for
+  # project-wide promotion in a single loop. This is a shortlist cap, not the
+  # total number of proof cases considered.
+  max_review_candidates_per_loop: 3
+
+  # Fallback promotion gate used when strategist review is unavailable or fails.
+  # Candidates scoring below this threshold are not promoted into project-wide
+  # adaptive memory.
+  promotion_threshold: 0.75
+
+  # Blended scoring weights for choosing which proof cases matter most next.
+  # They should sum close to 1.0.
+  weights:
+    # Emphasize contradictions between observed code behavior, threat lanes,
+    # assumptions, or prior loop expectations.
+    contradiction: 0.35
+
+    # Prefer uncovered invariants / threat lanes over already-covered ones.
+    coverage: 0.20
+
+    # Feed back previous proof outcomes. Unresolved or actionable failures are
+    # weighted up; already resolved duplicates are weighted down.
+    feedback: 0.25
+
+    # Reward new edge cases instead of repeatedly regenerating the same shape.
+    novelty: 0.20
+
+# Runtime note:
+# - `promoted_rules`, `deprioritized_patterns`, and `execution_blockers` are NOT config options.
+# - They are counters/artifacts written to `adaptive_memory.json` after audit loops:
+#   - `promoted_rules`: project-specific rules/patterns approved for reuse in later loops/sessions
+#   - `deprioritized_patterns`: soft-negative patterns that should be ranked lower, not treated as false forever
+#   - `execution_blockers`: codegen/harness/compile blockers that should be fixed, not interpreted as security rejection
 
 # Notes:
 # - Each model can have its own max_context setting

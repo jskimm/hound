@@ -7,6 +7,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from .session_files import canonical_session_dir, canonical_session_file, legacy_session_file
+
 
 @dataclass
 class SessionCoverage:
@@ -71,9 +73,16 @@ class SessionTracker:
             session_dir: Directory to store session data
             session_id: Unique session identifier
         """
-        self.session_dir = Path(session_dir)
+        base_dir = Path(session_dir)
+        if base_dir.name == session_id:
+            self.session_dir = base_dir
+            self.sessions_root = base_dir.parent
+        else:
+            self.sessions_root = base_dir
+            self.session_dir = canonical_session_dir(base_dir, session_id)
         self.session_id = session_id
-        self.session_file = self.session_dir / f"{session_id}.json"
+        self.session_file = canonical_session_file(self.sessions_root, session_id)
+        self.legacy_file = legacy_session_file(self.sessions_root, session_id)
         self.lock = threading.Lock()
         
         # Initialize or load session data
@@ -98,6 +107,12 @@ class SessionTracker:
                     return json.load(f)
             except Exception:
                 pass
+        if self.legacy_file.exists():
+            try:
+                with open(self.legacy_file) as f:
+                    return json.load(f)
+            except Exception:
+                pass
         
         # Initialize new session
         return {
@@ -105,6 +120,7 @@ class SessionTracker:
             'start_time': datetime.now().isoformat(),
             'status': 'active',
             'models': {},
+            'execution_policy': {},
             'investigations': [],
             'planning_history': [],
             'token_usage': {},
@@ -116,6 +132,13 @@ class SessionTracker:
         self.session_data['models'] = {
             'scout': scout_model,
             'strategist': strategist_model
+        }
+        self._save()
+
+    def set_execution_policy(self, *, allow_test_writes: bool = False):
+        """Persist execution policy flags for the session."""
+        self.session_data['execution_policy'] = {
+            'allow_test_writes': bool(allow_test_writes),
         }
         self._save()
     
